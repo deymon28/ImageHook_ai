@@ -1,0 +1,6 @@
+# capture + filters (no torch needed)
+bettercam
+opencv-python
+numpy
+psutil
+nvidia-ml-py

@@ -1,0 +1,2 @@
+# optional --detector: a CUDA build of torch must be installed separately (RTX 50xx needs CUDA 12.8+)
+ultralytics>=8.4
