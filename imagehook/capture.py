@@ -6,6 +6,7 @@ Everything heavy is optional and loaded before the loop starts. The process runs
 from __future__ import annotations
 
 import ctypes
+import shutil
 import sys
 import time
 from collections import deque
@@ -19,6 +20,7 @@ import psutil
 
 from . import __version__
 from .filters import CapturePolicy, Features, PolicyConfig, features, load_template
+from .clip import ClipRecorder, find_ffmpeg
 from .hotkeys import Keys, beep, parse_key
 from .session import Session
 
@@ -36,6 +38,7 @@ class RecordConfig:
     toggle_key: str = "f8"
     quit_key: str = "f9"
     burst_key: str = "mouse5"
+    clip_key: str = "f7"
     burst_back: float = 10.0  # a burst also keeps the unsaved frames of the last N seconds
     burst_forward: float = 5.0  # ...and every non-duplicate frame for the next N seconds
     any_window: bool = False  # record even when the game is not the foreground window
@@ -43,14 +46,22 @@ class RecordConfig:
     template: Path | None = None
     max_session_gb: float = 20.0
     min_free_gb: float = 20.0
-    max_ram_gb: float = 4.0
-    max_vram_gb: float = 2.0
+    target_ram_gb: float = 2.0  # going over a target only prints a warning
+    max_ram_gb: float = 4.0  # hard limit: detector off, then recording stops
+    target_vram_gb: float = 2.0
+    max_vram_gb: float = 4.0  # hard limit: detector off
+    target_gpu_pct: float = 20.0  # own GPU (SM) load the detector is throttled to
+    max_gpu_pct: float = 30.0  # sustained own load above this turns the detector off
     beep: bool = True
     autostart: bool = False
     duration: float | None = None
     detector: Path | None = None
-    det_imgsz: int = 1280
+    det_imgsz: int = 0  # 0 = native (the frame's long side), like screendet
     det_max_height: float = 0.15
+    ffmpeg: str | None = None
+    clip_fps: int = 30
+    clip_seconds: float = 120.0
+    clip_cq: int = 19
     policy: PolicyConfig = field(default_factory=PolicyConfig)
 
 
@@ -74,16 +85,42 @@ class Foreground:
         return self._names[p]
 
 
+class GpuGovernor:
+    """Keeps the detector's share of the GPU near the target by running it only on every `stride`-th evaluated
+    frame. update() gets this tool's own GPU load every few seconds; it returns "off" when the load stayed above
+    the hard limit `hard_checks` times in a row although the detector already runs as rarely as allowed."""
+
+    def __init__(self, target: float = 20.0, hard: float = 30.0, max_stride: int = 8, hard_checks: int = 3):
+        self.target, self.hard, self.max_stride, self.hard_checks = target, hard, max_stride, hard_checks
+        self.stride = 1
+        self._over = 0
+
+    def update(self, load: float) -> str | None:
+        if load > self.target and self.stride < self.max_stride:
+            self.stride *= 2
+        elif load < self.target / 2 and self.stride > 1:
+            self.stride //= 2
+        self._over = self._over + 1 if load > self.hard else 0
+        if self._over >= self.hard_checks and self.stride >= self.max_stride:
+            return "off"
+        return None
+
+
 class Resources:
-    """Own RSS / CPU / VRAM, sampled every few seconds."""
+    """RSS / CPU / VRAM / GPU load of this process and its clip encoder child, sampled every few seconds.
+    GPU load comes from NVML per-process samples (the game shares the device, so device-wide load says little)."""
 
     def __init__(self) -> None:
         self.proc = psutil.Process()
         self.proc.cpu_percent()
         self.ncpu = psutil.cpu_count() or 1
-        self.rss_peak = self.cpu_peak = self.vram_peak = 0.0
-        self.cpu_sum, self.samples = 0.0, 0
-        self.rss = self.vram = 0.0
+        self.rss_peak = self.cpu_peak = self.vram_peak = self.gpu_peak = self.enc_peak = 0.0
+        self.cpu_sum = self.gpu_sum = 0.0
+        self.samples = 0
+        self.rss = self.vram = self.cpu = self.gpu = self.enc = 0.0
+        self.gpu_supported = False
+        self._child: psutil.Process | None = None
+        self._util_ts = 0
         self._nvml = None
         try:
             import pynvml
@@ -91,32 +128,81 @@ class Resources:
             pynvml.nvmlInit()
             self._nvml = pynvml
             self._gpu = pynvml.nvmlDeviceGetHandleByIndex(0)
+            self.gpu_supported = True
         except Exception:  # no NVIDIA driver / nvidia-ml-py: VRAM is then taken from torch if a detector runs
             self._nvml = None
+
+    def set_child(self, pid: int | None) -> None:
+        try:
+            self._child = psutil.Process(pid) if pid else None
+            if self._child:
+                self._child.cpu_percent()
+        except psutil.Error:
+            self._child = None
+
+    def pids(self) -> set[int]:
+        return {self.proc.pid} | ({self._child.pid} if self._child else set())
 
     def vram_gb(self, torch_mod=None) -> float:
         if self._nvml is not None:
             try:
-                for p in self._nvml.nvmlDeviceGetComputeRunningProcesses(self._gpu):
-                    if p.pid == self.proc.pid and p.usedGpuMemory:
-                        return p.usedGpuMemory / 2**30
+                used = [p.usedGpuMemory for p in self._nvml.nvmlDeviceGetComputeRunningProcesses(self._gpu)
+                        if p.pid in self.pids() and p.usedGpuMemory]
+                if used:
+                    return sum(used) / 2**30
             except Exception:
                 pass
         if torch_mod is not None:  # WDDM hides per-process usage: allocator reserve + ~0.5 GB CUDA context
             return torch_mod.cuda.memory_reserved() / 2**30 + 0.5
         return 0.0
 
+    def gpu_load(self) -> tuple[float, float]:
+        """(SM %, encoder %) of our processes since the previous call: mean of NVML samples, summed over pids."""
+        if not self.gpu_supported:
+            return 0.0, 0.0
+        nv = self._nvml
+        try:
+            samples = nv.nvmlDeviceGetProcessUtilization(self._gpu, self._util_ts)
+        except nv.NVMLError_NotFound:
+            return 0.0, 0.0  # no samples since the last call: idle for us
+        except nv.NVMLError:
+            self.gpu_supported = False
+            return 0.0, 0.0
+        if samples:
+            self._util_ts = max(s.timeStamp for s in samples)
+        sm = enc = 0.0
+        for pid in self.pids():
+            mine = [s for s in samples if s.pid == pid]
+            if mine:
+                sm += sum(s.smUtil for s in mine) / len(mine)
+                enc += sum(s.encUtil for s in mine) / len(mine)
+        return sm, enc
+
     def sample(self, torch_mod=None) -> None:
-        self.rss = self.proc.memory_info().rss / 2**30
-        cpu = self.proc.cpu_percent() / self.ncpu  # share of the whole CPU
+        rss = self.proc.memory_info().rss
+        cpu = self.proc.cpu_percent()
+        if self._child:
+            try:
+                rss += self._child.memory_info().rss
+                cpu += self._child.cpu_percent()
+            except psutil.Error:
+                self._child = None
+        self.rss, self.cpu = rss / 2**30, cpu / self.ncpu  # CPU as a share of the whole CPU
         self.vram = self.vram_gb(torch_mod)
-        self.rss_peak, self.cpu_peak, self.vram_peak = max(self.rss_peak, self.rss), max(self.cpu_peak, cpu), max(self.vram_peak, self.vram)
-        self.cpu_sum += cpu
+        self.gpu, self.enc = self.gpu_load()
+        self.rss_peak, self.cpu_peak = max(self.rss_peak, self.rss), max(self.cpu_peak, self.cpu)
+        self.vram_peak = max(self.vram_peak, self.vram)
+        self.gpu_peak, self.enc_peak = max(self.gpu_peak, self.gpu), max(self.enc_peak, self.enc)
+        self.cpu_sum += self.cpu
+        self.gpu_sum += self.gpu
         self.samples += 1
 
     def report(self) -> dict:
-        return {"rss_peak_gb": round(self.rss_peak, 3), "cpu_avg_pct": round(self.cpu_sum / max(self.samples, 1), 2),
-                "cpu_peak_pct": round(self.cpu_peak, 2), "vram_peak_gb": round(self.vram_peak, 3)}
+        n = max(self.samples, 1)
+        return {"rss_peak_gb": round(self.rss_peak, 3), "cpu_avg_pct": round(self.cpu_sum / n, 2),
+                "cpu_peak_pct": round(self.cpu_peak, 2), "vram_peak_gb": round(self.vram_peak, 3),
+                "gpu_sm_avg_pct": round(self.gpu_sum / n, 1), "gpu_sm_peak_pct": round(self.gpu_peak, 1),
+                "gpu_encoder_peak_pct": round(self.enc_peak, 1), "gpu_per_process": self.gpu_supported}
 
 
 def primary_output_index(bettercam) -> int:
@@ -144,7 +230,8 @@ class Recorder:
     def __init__(self, cfg: RecordConfig):
         self.cfg = cfg
         self.keys = Keys()
-        self.vk_toggle, self.vk_quit, self.vk_burst = (parse_key(k) for k in (cfg.toggle_key, cfg.quit_key, cfg.burst_key))
+        self.vk_toggle, self.vk_quit, self.vk_burst, self.vk_clip = (
+            parse_key(k) for k in (cfg.toggle_key, cfg.quit_key, cfg.burst_key, cfg.clip_key))
         template = load_template(cfg.template) if cfg.template else load_template()
         self.policy = CapturePolicy(cfg.policy, template if cfg.ui_filter else None)
         self.fg = Foreground()
@@ -159,6 +246,9 @@ class Recorder:
         self.detector = None
         self.det_runs, self.det_time = 0, 0.0
         self.torch = None
+        self.governor = GpuGovernor(cfg.target_gpu_pct, cfg.max_gpu_pct)
+        self.clip: ClipRecorder | None = None
+        self.over_target: set[str] = set()
 
     # ------------------------------------------------------------ helpers
     def log(self, msg: str) -> None:
@@ -172,6 +262,8 @@ class Recorder:
             d["detector"] = Path(d["detector"]).name  # no local paths in the session summary
         if d.get("template"):
             d["template"] = Path(d["template"]).name
+        if d.get("ffmpeg"):
+            d["ffmpeg"] = Path(d["ffmpeg"]).name
         return d
 
     def extra(self) -> dict:
@@ -180,6 +272,9 @@ class Recorder:
              "settings": self.settings(), "resources": self.res.report(), "detector_runs": self.det_runs}
         if self.det_runs:
             e["detector_ms_avg"] = round(1000 * self.det_time / self.det_runs, 1)
+            e["detector_stride_end"] = self.governor.stride
+        if self.clip and self.clip.clips:
+            e["clips"] = self.clip.clips
         return e
 
     def start(self) -> None:
@@ -224,7 +319,7 @@ class Recorder:
         if s is None:
             return ""
         return (f"saved {s.n_saved} {dict(s.saved)} | skipped {dict(s.skipped)} | {s.bytes / 2**30:.2f} GB | "
-                f"RAM {self.res.rss:.2f} GB, VRAM {self.res.vram:.2f} GB")
+                f"RAM {self.res.rss:.2f} GB, VRAM {self.res.vram:.2f} GB, own GPU {self.res.gpu:.0f}%")
 
     def disable_detector(self, why: str) -> None:
         if self.detector is None:
@@ -273,10 +368,12 @@ class Recorder:
         ui = self.policy.ui(f)
         det = None
         if self.detector is not None and ui >= self.cfg.policy.ui_threshold:
-            t0 = time.perf_counter()
-            det = self.detector(frame)
-            self.det_time += time.perf_counter() - t0
-            self.det_runs += 1
+            det = 0.0  # throttled frames count as "nothing new seen"; an earlier hit is still held
+            if self.evaluations % self.governor.stride == 0:
+                t0 = time.perf_counter()
+                det = self.detector(frame)
+                self.det_time += time.perf_counter() - t0
+                self.det_runs += 1
         d = self.policy.evaluate(now, f, det, burst=now <= self.burst_until, ui=ui)
         if d.save:
             if self.save(frame, wall, d.reason, d.novelty, d.ui, det):
@@ -288,9 +385,29 @@ class Recorder:
         while self.ring and self.ring[0].t < now - self.cfg.burst_back:
             self.ring.popleft()
 
+    def warn_target(self, name: str, value: float, target: float, unit: str) -> None:
+        """Going over a target is allowed; say so once per crossing."""
+        if value > target and name not in self.over_target:
+            self.over_target.add(name)
+            self.log(f"note: {name} {value:.2f}{unit} is above the {target:g}{unit} target")
+        elif value <= target * 0.9:
+            self.over_target.discard(name)
+
     def check_limits(self) -> None:
         s = self.session
+        if self.clip is not None:
+            if (info := self.clip.poll()) is not None:
+                self.clip_done(info)
         self.res.sample(self.torch if self.detector is not None else None)
+        self.warn_target("RAM", self.res.rss, self.cfg.target_ram_gb, " GB")
+        self.warn_target("VRAM", self.res.vram, self.cfg.target_vram_gb, " GB")
+        self.warn_target("own GPU load", self.res.gpu, self.cfg.target_gpu_pct, "%")
+        if self.detector is not None:
+            stride = self.governor.stride
+            if self.governor.update(self.res.gpu) == "off":
+                self.disable_detector(f"own GPU load {self.res.gpu:.0f}% > {self.cfg.max_gpu_pct:g}% even when throttled")
+            elif self.governor.stride != stride:
+                self.log(f"detector now runs on every {self.governor.stride}. frame (own GPU load {self.res.gpu:.0f}%)")
         if self.res.vram > self.cfg.max_vram_gb:
             self.disable_detector(f"VRAM {self.res.vram:.2f} GB > {self.cfg.max_vram_gb} GB")
         if self.res.rss > self.cfg.max_ram_gb:
@@ -307,6 +424,33 @@ class Recorder:
             self.blocked = f"less than {self.cfg.min_free_gb} GB free on the output disk"
             self.stop(self.blocked)
 
+    # ------------------------------------------------------------ clips
+    def toggle_clip(self) -> None:
+        if self.clip is None:
+            self.log("clips need ffmpeg with ddagrab and h264_nvenc on PATH (or --ffmpeg)")
+            beep(400, 120, self.cfg.beep, times=3)
+            return
+        if self.clip.active:
+            self.clip_done(self.clip.stop())
+            return
+        self.cfg.out.mkdir(parents=True, exist_ok=True)
+        if shutil.disk_usage(self.cfg.out).free / 2**30 < self.cfg.min_free_gb:
+            self.log(f"cannot start a clip: less than {self.cfg.min_free_gb} GB free")
+            beep(400, 120, self.cfg.beep, times=3)
+            return
+        path = self.clip.start()
+        self.res.set_child(self.clip.pid)
+        beep(1000, 60, self.cfg.beep, times=2)
+        self.log(f"CLIP started: {path.name} (stops by itself after {self.cfg.clip_seconds:g} s)")
+
+    def clip_done(self, info: dict | None) -> None:
+        if info is None:
+            return
+        self.res.set_child(None)
+        beep(700, 60, self.cfg.beep, times=2)
+        state = "saved" if info["ok"] else f"FAILED ({info.get('error', 'ffmpeg error')})"
+        self.log(f"CLIP {state}: {info['file']} {info['seconds']} s, {info['bytes'] / 2**20:.0f} MB")
+
     # ------------------------------------------------------------ main loop
     def run(self) -> None:
         cfg = self.cfg
@@ -320,7 +464,7 @@ class Recorder:
 
             self.log(f"loading detector {cfg.detector.name} (imgsz {cfg.det_imgsz})...")
             self.detector = Detector(DetectorConfig(cfg.detector, cfg.det_imgsz, max_height=cfg.det_max_height,
-                                                    max_vram_gb=min(1.0, cfg.max_vram_gb)))
+                                                    max_vram_gb=min(1.5, cfg.target_vram_gb)))
             self.torch = self.detector.torch
             self.res.sample(self.torch)
             self.log(f"detector ready: RAM {self.res.rss:.2f} GB, VRAM {self.res.vram:.2f} GB")
@@ -329,8 +473,12 @@ class Recorder:
         idx = primary_output_index(bettercam) if cfg.output_idx is None else cfg.output_idx
         cam = bettercam.create(output_idx=idx, output_color="BGR")
         self.log(f"capturing output {idx} {cam.width}x{cam.height} -> {cfg.out}  (saved height: {cfg.height or 'native'})")
+        if ffmpeg := find_ffmpeg(cfg.ffmpeg):
+            self.clip = ClipRecorder(ffmpeg, cfg.out, idx, cfg.clip_fps, cfg.clip_seconds, cfg.clip_cq)
+        clip_note = "" if self.clip else " (unavailable: no ffmpeg)"
         self.log(f"{cfg.toggle_key.upper()} start/stop | {cfg.burst_key} burst (keep last {cfg.burst_back:g} s + next "
-                 f"{cfg.burst_forward:g} s) | {cfg.quit_key.upper()} quit")
+                 f"{cfg.burst_forward:g} s) | {cfg.clip_key.upper()} video clip start/stop{clip_note} | "
+                 f"{cfg.quit_key.upper()} quit")
         if not cfg.any_window:
             self.log("frames are taken only while the game window is in the foreground")
         if cfg.autostart:
@@ -348,6 +496,8 @@ class Recorder:
                     break
                 if self.keys.pressed(self.vk_toggle):
                     self.stop() if self.collecting else self.start()
+                if self.keys.pressed(self.vk_clip):
+                    self.toggle_clip()
                 if self.keys.pressed(self.vk_burst) and self.collecting:
                     self.burst_until = now + cfg.burst_forward
                     n = len(self.ring)
@@ -370,6 +520,8 @@ class Recorder:
             pass
         finally:
             self.collecting = False
+            if self.clip is not None and self.clip.active:
+                self.clip_done(self.clip.stop())
             self.close_session()
             cam.release()
             self.log("done")

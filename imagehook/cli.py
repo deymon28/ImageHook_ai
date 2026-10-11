@@ -43,9 +43,12 @@ def cmd_record(a: argparse.Namespace) -> None:
                        tick=a.min_interval, toggle_key=a.toggle_key, quit_key=a.quit_key, burst_key=a.burst_key,
                        burst_back=a.burst_back, burst_forward=a.burst_forward, any_window=a.any_window,
                        ui_filter=not a.no_ui_filter, template=a.template, max_session_gb=a.max_session_gb,
-                       min_free_gb=a.min_free_gb, max_ram_gb=a.max_ram_gb, max_vram_gb=a.max_vram_gb,
-                       beep=not a.no_beep, autostart=a.autostart, duration=a.duration, detector=a.detector,
-                       det_imgsz=a.det_imgsz, det_max_height=a.det_max_height, policy=policy_from(a))
+                       min_free_gb=a.min_free_gb, target_ram_gb=a.target_ram_gb, max_ram_gb=a.max_ram_gb,
+                       target_vram_gb=a.target_vram_gb, max_vram_gb=a.max_vram_gb, target_gpu_pct=a.target_gpu_pct,
+                       max_gpu_pct=a.max_gpu_pct, beep=not a.no_beep, autostart=a.autostart, duration=a.duration,
+                       detector=a.detector, det_imgsz=a.det_imgsz, det_max_height=a.det_max_height,
+                       clip_key=a.clip_key, ffmpeg=a.ffmpeg, clip_fps=a.clip_fps, clip_seconds=a.clip_seconds,
+                       clip_cq=a.clip_cq, policy=policy_from(a))
     Recorder(cfg).run()
 
 
@@ -89,6 +92,48 @@ def cmd_replay(a: argparse.Namespace) -> None:
         print(f"kept frames copied to {write_dir}")
 
 
+def add_clip_args(ap: argparse.ArgumentParser, standalone: bool = False) -> None:
+    g = ap.add_argument_group("video clips (ffmpeg ddagrab + NVENC, H.264, native resolution)")
+    if not standalone:
+        g.add_argument("--clip-key", default="f7", help="start/stop a clip (default f7)")
+    g.add_argument("--clip-seconds", type=float, default=60.0 if standalone else 120.0,
+                   help="clip length (standalone) or the longest clip before it stops by itself")
+    g.add_argument("--clip-fps", type=int, default=30)
+    g.add_argument("--clip-cq", type=int, default=19, help="NVENC constant quality, lower = better and larger (default 19)")
+    g.add_argument("--ffmpeg", help="ffmpeg executable (default: ffmpeg on PATH or $IMAGEHOOK_FFMPEG)")
+
+
+def cmd_clip(a: argparse.Namespace) -> None:
+    import time
+
+    from .clip import ClipRecorder, find_ffmpeg
+
+    ffmpeg = find_ffmpeg(a.ffmpeg)
+    if not ffmpeg:
+        sys.exit("ffmpeg not found: put it on PATH, set IMAGEHOOK_FFMPEG or pass --ffmpeg")
+    idx = a.output
+    if idx is None:
+        import bettercam
+
+        from .capture import primary_output_index
+
+        idx = primary_output_index(bettercam)
+    if a.delay:
+        print(f"recording starts in {a.delay:g} s...")
+        time.sleep(a.delay)
+    rec = ClipRecorder(ffmpeg, a.out, idx, a.clip_fps, a.clip_seconds, a.clip_cq)
+    path = rec.start()
+    print(f"recording {path} for {a.clip_seconds:g} s (Ctrl+C stops earlier)")
+    try:
+        while (info := rec.poll()) is None:
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        info = rec.stop()
+    print(json.dumps(info, indent=2))
+    if not info["ok"]:
+        sys.exit(1)
+
+
 def cmd_template(a: argparse.Namespace) -> None:
     import cv2
 
@@ -112,7 +157,7 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="imagehook", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    r = sub.add_parser("record", help="record gameplay frames (hotkeys: F8 start/stop, mouse5 burst, F9 quit)")
+    r = sub.add_parser("record", help="record gameplay frames (hotkeys: F8 start/stop, mouse5 burst, F7 clip, F9 quit)")
     r.add_argument("--out", type=Path, default=DEFAULT_OUT, help="root folder for sessions (default: ./captures or $IMAGEHOOK_OUT)")
     r.add_argument("--output", type=int, help="DXGI output (monitor) index, default: primary")
     r.add_argument("--height", type=int, default=0, help="saved frame height; 0 = native monitor resolution (default)")
@@ -126,10 +171,15 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("--any-window", action="store_true", help="record even when the game is not the foreground window")
     r.add_argument("--max-session-gb", type=float, default=20.0)
     r.add_argument("--min-free-gb", type=float, default=20.0)
-    r.add_argument("--max-ram-gb", type=float, default=4.0)
-    r.add_argument("--max-vram-gb", type=float, default=2.0)
+    r.add_argument("--target-ram-gb", type=float, default=2.0, help="RAM target: going over only prints a note (default 2)")
+    r.add_argument("--max-ram-gb", type=float, default=4.0, help="hard RAM limit: detector off, then recording stops (default 4)")
+    r.add_argument("--target-vram-gb", type=float, default=2.0, help="VRAM target (default 2)")
+    r.add_argument("--max-vram-gb", type=float, default=4.0, help="hard VRAM limit: detector off (default 4)")
+    r.add_argument("--target-gpu-pct", type=float, default=20.0, help="own GPU load the detector is throttled to (default 20)")
+    r.add_argument("--max-gpu-pct", type=float, default=30.0, help="sustained own GPU load that turns the detector off (default 30)")
     r.add_argument("--detector", type=Path, help="optional YOLO .pt weights: frames with (small) people are saved more often")
-    r.add_argument("--det-imgsz", type=int, default=1280)
+    r.add_argument("--det-imgsz", type=int, default=0, help="detector input size; 0 = native, 2560 at 1440p (default)")
+    add_clip_args(r)
     r.add_argument("--no-beep", action="store_true")
     r.add_argument("--autostart", action="store_true", help="start recording immediately")
     r.add_argument("--duration", type=float, help="quit after N seconds")
@@ -141,11 +191,18 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--tick", type=float, default=0.5, help="video only: evaluate a frame every N s (default 0.5)")
     p.add_argument("--det-labels", nargs="?", const="auto", help="emulate the detector with prelabel output (YOLO txt with a confidence column); without a value: SESSION/labels_auto")
     p.add_argument("--detector", type=Path, help="run real YOLO .pt weights on the frames (GPU, game closed)")
-    p.add_argument("--det-imgsz", type=int, default=1280)
+    p.add_argument("--det-imgsz", type=int, default=0, help="0 = the frame's long side (default)")
     p.add_argument("--max-vram-gb", type=float, default=1.0)
     p.add_argument("--write", type=Path, help="copy kept frames to WRITE/<session>/frames")
     add_policy_args(p)
     p.set_defaults(func=cmd_replay)
+
+    c = sub.add_parser("clip", help="record one native-resolution video clip (for screendet run --source)")
+    c.add_argument("--out", type=Path, default=DEFAULT_OUT, help="clips go to OUT/clips (default: ./captures or $IMAGEHOOK_OUT)")
+    c.add_argument("--output", type=int, help="DXGI output (monitor) index, default: primary")
+    c.add_argument("--delay", type=float, default=0.0, help="wait N s before recording (time to switch to the game)")
+    add_clip_args(c, standalone=True)
+    c.set_defaults(func=cmd_clip)
 
     t = sub.add_parser("template", help="rebuild the HUD icon template from recorded sessions (mostly gameplay)")
     t.add_argument("sessions", type=Path, nargs="+")

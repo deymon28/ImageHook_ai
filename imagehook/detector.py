@@ -17,7 +17,7 @@ from .filters import ICON_ZONE
 @dataclass
 class DetectorConfig:
     weights: Path
-    imgsz: int = 1280
+    imgsz: int = 0  # 0 = native: the frame's long side (2560 for 1440p), like screendet
     conf: float = 0.1  # proposals below this are not even reported; the policy threshold is PolicyConfig.det_conf
     max_height: float = 0.15  # ignore boxes taller than this share of the frame: close people matter little
     max_vram_gb: float = 1.0  # PyTorch allocator cap (the CUDA context comes on top)
@@ -55,7 +55,8 @@ class Detector:
         self(np.zeros((1440, 2560, 3), np.uint8))  # warm-up so the first real frame is not slow
 
     def __call__(self, frame_bgr: np.ndarray) -> float:
-        r = self.model.predict(frame_bgr, imgsz=self.cfg.imgsz, conf=self.cfg.conf, quantize=16, device=0,
+        imgsz = self.cfg.imgsz or max(frame_bgr.shape[:2])
+        r = self.model.predict(frame_bgr, imgsz=imgsz, conf=self.cfg.conf, quantize=16, device=0,
                                max_det=50, verbose=False)[0]
         return relevant_conf(r.boxes.xywhn.tolist(), r.boxes.conf.tolist(), self.cfg.max_height)
 

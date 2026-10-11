@@ -3,7 +3,8 @@
 Light gameplay frame recorder for building person-detection datasets for Arena Breakout Infinite (`UAGame.exe`).
 It captures the monitor via DXGI while you play and saves only frames worth labeling. It skips interface screens
 (inventory, map, loading, death and extraction screens), near-duplicates and long still scenes, and records more
-often when the scene changes or a person is detected.
+often when the scene changes or a person is detected. It can also record short native-resolution video clips, so
+that models can be compared on the same real footage (`screendet run --source clip.mp4`).
 
 It is one part of a three-project system:
 
@@ -29,6 +30,8 @@ Frames are saved at the native monitor resolution (2560x1440 on a 1440p monitor)
 1–1.5 MB per gameplay frame. `--height 1080` scales them down like the old collector did. The output root is
 `./captures` by default; set it with `--out` or the `IMAGEHOOK_OUT` environment variable.
 
+Video clips go to `<out>/clips/clip_YYYYmmdd_HHMMSS.mp4`: H.264, native resolution, 30 FPS.
+
 ## Setup
 
 Windows 10/11, Python 3.11+.
@@ -42,6 +45,10 @@ The optional detector (`--detector`) also needs `requirements-detector.txt` and 
 (RTX 50xx needs CUDA 12.8+). Install PyTorch separately, globally or in the venv. `--system-site-packages` lets the
 venv reuse a global install.
 
+Video clips need ffmpeg 6 or newer with the `ddagrab` filter and the `h264_nvenc` encoder (for example a "gpl"
+Windows build). Put it on `PATH`, set `IMAGEHOOK_FFMPEG`, or pass `--ffmpeg`. Without ffmpeg, frame recording still
+works.
+
 ## Recording
 
 ```
@@ -53,10 +60,11 @@ venv reuse a global install.
 |---|---|
 | `F8` | start / stop recording (a session folder is created on the first start) |
 | `Mouse 5` (front side button) | **burst**: keep the unsaved frames of the last 10 s and every new frame for the next 5 s |
+| `F7` | start / stop a video clip (stops by itself after 120 s, `--clip-seconds`); works with or without frame recording |
 | `F9` | quit |
 
 Press burst whenever you have just seen people, including after the fight. The last 10 s are kept in memory, so you
-do not need to react at the right moment. Keys are configurable (`--toggle-key`, `--burst-key`, `--quit-key`; names
+do not need to react at the right moment. Keys are configurable (`--toggle-key`, `--burst-key`, `--clip-key`, `--quit-key`; names
 like `f7`, `mouse4`, `x`, `numpad1`, `0x2D`). Keys are read globally and still reach the game, so choose one that the
 game does not use. Short beeps confirm the keys. Three low beeps mean that recording stopped on its own because of a
 limit.
@@ -95,7 +103,9 @@ All thresholds are command line options (`python -m imagehook record --help`).
 ### Optional detector
 
 `--detector weights.pt` loads a YOLO model with PyTorch (never TensorRT) at startup. It runs on each evaluated
-frame that is not an interface screen, at `imgsz` 1280 with FP16. The detector **never drops frames**: a person
+frame that is not an interface screen, at native resolution (`imgsz` 2560 at 1440p, like `screendet`;
+`--det-imgsz`) with FP16. If the tool's own GPU load goes above 20%, the detector runs only on every 2nd, 4th or 8th
+evaluated frame. If the load still stays above 30%, the detector is turned off. The detector **never drops frames**: a person
 with confidence ≥ 0.2 (`--det-conf`) makes the recorder save more often, and while it sees nobody the base interval
 becomes 2 s (`--idle-interval`). Boxes taller than 15% of the frame (`--det-max-height`) are ignored, because close
 targets matter least. Detections on the HUD body icon are ignored too.
@@ -103,18 +113,43 @@ targets matter least. Detections on the HUD body icon are ignored too.
 ## Resource use
 
 The game crashed once when other software used too much of the machine, so the recorder is kept light: no torch in
-the default mode, below-normal CPU priority, single-threaded OpenCV, and a bounded writer queue. Hard limits:
-4 GB RAM (`--max-ram-gb`) and 2 GB VRAM (`--max-vram-gb`). Above a limit the detector is turned off first, then
-recording stops.
+the default mode, below-normal CPU priority (the ffmpeg child too), single-threaded OpenCV, and a bounded writer
+queue.
 
-Measured on Windows 11, RTX 5070 Ti, 2560x1440, worst case of saving every 0.5 s:
+| Resource | Target (a note is printed above it) | Hard limit |
+|---|---|---|
+| RAM (tool + ffmpeg) | 2 GB (`--target-ram-gb`) | 4 GB (`--max-ram-gb`): detector off, then recording stops |
+| VRAM | 2 GB (`--target-vram-gb`) | 4 GB (`--max-vram-gb`): detector off |
+| Own GPU load | 20% (`--target-gpu-pct`): the detector is throttled | 30% sustained (`--max-gpu-pct`): detector off |
 
-| Mode | RAM (RSS) | VRAM | CPU (share of the whole CPU) |
-|---|---|---|---|
-| default | 0.12 GB | 0 | 0.4% avg, 4.7% peak |
-| `--detector` (YOLO26s, 1280) | 1.96 GB | about 0.65 GB (PyTorch reserve 0.15 GB + CUDA context) | 0.8% avg, 6.5% peak; about 24 ms GPU per frame, 2 frames/s |
+The tool's own GPU load comes from NVML per-process samples (`nvmlDeviceGetProcessUtilization` for its own pid and
+the ffmpeg child), because the game shares the device. The status line and `capture.json` report it.
 
-The burst buffer holds up to 20 full frames (about 220 MB at 1440p) on top of these numbers.
+Measured on Windows 11, RTX 5070 Ti, 2560x1440, worst case of saving every 0.5 s. During the measurement another
+process kept the GPU about 70% busy, so the detector times are pessimistic:
+
+| Mode | RAM (RSS) | VRAM | Own GPU (SM) | CPU (share of the whole CPU) |
+|---|---|---|---|---|
+| default | 0.12 GB | 0 | 0 | 0.4% avg, 4.7% peak |
+| `--detector` (YOLO26s, native 2560) | 1.92 GB | about 1.0 GB (PyTorch reserve + estimated 0.5 GB CUDA context) | 2.1% avg, 14% peak; 62 ms per frame, 2 frames/s | 1.3% avg, 7% peak |
+| video clip (ffmpeg ddagrab + NVENC, 1440p30) | 0.32 GB including Python | 0 | 0.4% avg, 6% peak | 0.25% avg |
+
+The burst buffer holds up to 20 full frames (about 220 MB at 1440p) on top of these numbers. Clip size depends on
+the scene: about 6 Mbit/s for a mostly still desktop, noticeably more for gameplay at the default quality
+(`--clip-cq 19`). Plan for a few hundred MB per minute.
+
+## Video clips
+
+Press `F7` during `record`, or run it standalone:
+
+```
+.venv\Scripts\python -m imagehook clip --clip-seconds 60 --delay 5     # 5 s to switch to the game
+```
+
+ffmpeg captures and encodes on the GPU: `ddagrab` (DXGI duplication into D3D11 memory) feeds `h264_nvenc`, the
+dedicated video encoder. No frame passes through Python, and the CPU load stays negligible. Clips are H.264 Main
+4:2:0, which OpenCV reads directly. Pass a clip to `screendet run --source clip.mp4`, or check the filters on it with
+`imagehook replay clip.mp4`.
 
 ## Checking the filters offline
 
@@ -156,7 +191,8 @@ changes:
 ```
 
 The tests use synthetic frames: interface and duplicate decisions, the novelty rules, the detector and burst paths,
-session naming (including midnight), and replay. They need neither the game nor a GPU.
+the GPU-load governor, clip command and names, session naming (including midnight), and replay. They need neither
+the game nor a GPU. `IMAGEHOOK_TEST_CLIP=1` adds a 2 s real screen clip (needs ffmpeg and NVENC).
 
 ## Limits
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import cv2
 import numpy as np
