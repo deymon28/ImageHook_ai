@@ -1,0 +1,76 @@
+# ImageHook settings. Copy this file to imagehook.toml (or run: imagehook config --init) and uncomment what you
+# want to change. Every value here is the built-in default. Precedence: defaults < this file < command line.
+#
+# The file is looked up in this order: --config PATH, $IMAGEHOOK_CONFIG, ./imagehook.toml, <project>/imagehook.toml.
+# Keys are the long command line options (ui_threshold = --ui-threshold); sections only group them.
+# Relative paths are relative to this file. `imagehook config` prints the settings in effect.
+
+[output]
+# out = "captures"              # root folder for sessions and clips (default: ./captures or $IMAGEHOOK_OUT)
+# output = 0                    # DXGI output (monitor) index; not set = the primary monitor
+# height = 0                    # saved frame height; 0 = native monitor resolution
+# format = "jpg"                # "jpg" or "png"
+# quality = 95                  # JPEG quality
+# max_session_gb = 20.0         # a session stops at this size; the next start opens a new session
+# min_free_gb = 20.0            # recording stops when the output disk has less free space
+
+[game]
+# game_processes = ["uagame.exe"]   # frames are taken only while one of these is the foreground window
+# any_window = false                # true: take frames whatever window is in front
+# no_ui_filter = false              # true: keep interface screens too
+# template = "imagehook/assets/hud_icon.png"   # HUD icon template (rebuild it with: imagehook template)
+# Normalized [x1, y1, x2, y2] boxes of the 16:9 frame (0..1). Change them if the HUD layout or scale changes.
+# icon_zone = [0.0, 0.75, 0.07, 0.92]     # body-status icon: present only in gameplay; detections on it are ignored
+# change_ignore = [[0.0, 0.0, 1.0, 0.05], [0.0, 0.93, 1.0, 1.0], [0.0, 0.55, 0.22, 1.0], [0.85, 0.8, 1.0, 1.0]]
+#                                       # areas that change on their own (overlays, chat, weapon, stamina)
+
+[keys]
+# Names: f1..f24, a..z, 0..9, numpad0..9, mouse3/mouse4/mouse5, space, tab, insert, home, ... or a code like "0x2D".
+# toggle_key = "f8"             # start / stop recording
+# burst_key = "mouse5"          # keep the last burst_back s and every new frame for burst_forward s
+# clip_key = "f7"               # start / stop a video clip
+# quit_key = "f9"
+# burst_back = 10.0
+# burst_forward = 5.0
+# no_beep = false               # true: no confirmation beeps
+
+[filters]
+# One frame is checked every min_interval s. A frame is saved when novelty x seconds since the last save
+# reaches base_interval; novelty = max(mean change / global_ref, largest local change / local_ref).
+# ui_threshold = 0.3            # HUD icon similarity below this = interface screen (skipped)
+# dup_novelty = 0.15            # novelty below this = duplicate of the last saved frame (never saved)
+# min_interval = 0.5            # s: at most this often (a camera turn is saved this soon)
+# base_interval = 1.0           # s: an average change is saved about this often
+# max_interval = 10.0           # s: a nearly still view is still saved this often
+# global_ref = 15.0             # mean grayscale change (0..255) that counts as novelty 1
+# local_ref = 0.6               # share of changed pixels in one 20x20 thumbnail cell that counts as novelty 1
+
+[detector]
+# detector = "models/person.pt" # YOLO .pt weights (PyTorch, never TensorRT); not set = no detector
+# det_imgsz = 0                 # detector input size; 0 = the frame's long side (2560 at 1440p)
+# det_conf = 0.2                # confidence that counts as a person
+# det_interval = 1.0            # s between saved frames while a person is seen
+# det_hold = 2.0                # s a detection keeps the faster rate
+# idle_interval = 2.0           # base interval while the detector sees nobody
+# det_max_height = 0.15         # ignore detections taller than this share of the frame (close people)
+
+[clips]
+# Needs ffmpeg 6+ with ddagrab and h264_nvenc.
+# ffmpeg = "C:/tools/ffmpeg/bin/ffmpeg.exe"   # not set = ffmpeg on PATH or $IMAGEHOOK_FFMPEG
+# clip_seconds = 120.0          # longest clip before it stops by itself (standalone `imagehook clip`: its length)
+# clip_fps = 30
+# clip_cq = 19                  # NVENC constant quality: lower = better and larger
+# delay = 0.0                   # standalone `imagehook clip` only: wait this long before recording
+
+[limits]
+# Going over a target only prints a note; a hard limit turns the detector off (and for RAM then stops recording).
+# target_ram_gb = 2.0
+# max_ram_gb = 4.0
+# target_vram_gb = 2.0
+# max_vram_gb = 4.0
+# target_gpu_pct = 20.0         # own GPU load the detector is throttled to
+# max_gpu_pct = 30.0            # sustained own GPU load that turns the detector off
+
+[run]
+# autostart = false             # start recording right away
+# duration = 3600.0             # quit after this many seconds; not set = run until the quit key

@@ -18,13 +18,13 @@ import cv2
 import numpy as np
 import psutil
 
-from . import __version__
-from .filters import CapturePolicy, Features, PolicyConfig, features, load_template
+from . import __version__, report
+from .filters import CHANGE_IGNORE, ICON_ZONE, Box, CapturePolicy, Features, HudLayout, PolicyConfig, load_template
 from .clip import ClipRecorder, find_ffmpeg
 from .hotkeys import Keys, beep, parse_key
 from .session import Session
 
-GAME_PROCESSES = ("uagame.exe",)
+GAME_PROCESSES = ("uagame.exe",)  # Arena Breakout Infinite
 
 
 @dataclass
@@ -42,6 +42,9 @@ class RecordConfig:
     burst_back: float = 10.0  # a burst also keeps the unsaved frames of the last N seconds
     burst_forward: float = 5.0  # ...and every non-duplicate frame for the next N seconds
     any_window: bool = False  # record even when the game is not the foreground window
+    game_processes: tuple[str, ...] = GAME_PROCESSES  # executable names (lower case) of the game window
+    icon_zone: Box = ICON_ZONE  # HUD layout, see filters.HudLayout
+    change_ignore: tuple[Box, ...] = CHANGE_IGNORE
     ui_filter: bool = True
     template: Path | None = None
     max_session_gb: float = 20.0
@@ -63,6 +66,7 @@ class RecordConfig:
     clip_seconds: float = 120.0
     clip_cq: int = 19
     policy: PolicyConfig = field(default_factory=PolicyConfig)
+    config: str | None = None  # name of the config file the settings came from (only reported)
 
 
 class Foreground:
@@ -233,7 +237,9 @@ class Recorder:
         self.vk_toggle, self.vk_quit, self.vk_burst, self.vk_clip = (
             parse_key(k) for k in (cfg.toggle_key, cfg.quit_key, cfg.burst_key, cfg.clip_key))
         template = load_template(cfg.template) if cfg.template else load_template()
-        self.policy = CapturePolicy(cfg.policy, template if cfg.ui_filter else None)
+        self.layout = HudLayout(tuple(cfg.icon_zone), tuple(tuple(b) for b in cfg.change_ignore))
+        self.games = tuple(g.lower() for g in cfg.game_processes)
+        self.policy = CapturePolicy(cfg.policy, template if cfg.ui_filter else None, self.layout)
         self.fg = Foreground()
         self.res = Resources()
         self.session: Session | None = None
@@ -249,6 +255,7 @@ class Recorder:
         self.governor = GpuGovernor(cfg.target_gpu_pct, cfg.max_gpu_pct)
         self.clip: ClipRecorder | None = None
         self.over_target: set[str] = set()
+        self._status_saved: tuple[float, int] | None = None  # (rec_seconds, saved) at the previous status line
 
     # ------------------------------------------------------------ helpers
     def log(self, msg: str) -> None:
@@ -311,15 +318,28 @@ class Recorder:
     def close_session(self) -> None:
         if self.session:
             self.session.close(self.extra())
-            self.log(f"session closed: {self.session.dir}  {self.status_line()}")
+            self.log(f"session closed: {self.session.dir}")
+            try:
+                for line in report.format_session(report.session_stats(self.session.dir)):
+                    print(line, flush=True)
+            except (OSError, ValueError, KeyError) as e:  # the summary is informative only
+                self.log(f"could not summarize the session: {e}")
             self.session = None
+            self._status_saved = None
 
     def status_line(self) -> str:
         s = self.session
         if s is None:
             return ""
-        return (f"saved {s.n_saved} {dict(s.saved)} | skipped {dict(s.skipped)} | {s.bytes / 2**30:.2f} GB | "
-                f"RAM {self.res.rss:.2f} GB, VRAM {self.res.vram:.2f} GB, own GPU {self.res.gpu:.0f}%")
+        per_min = None
+        if self._status_saved is not None and self.rec_seconds - self._status_saved[0] > 1:
+            per_min = (s.n_saved - self._status_saved[1]) * 60 / (self.rec_seconds - self._status_saved[0])
+        self._status_saved = (self.rec_seconds, s.n_saved)
+        extra = ""
+        if self.detector is not None:
+            extra = f", detector every {self.governor.stride}. frame"
+        return report.status_line(self.rec_seconds, s.saved, s.skipped, self.evaluations, s.bytes / 2**30, per_min,
+                                  self.cfg.tick, self.res.rss, self.res.vram, self.res.gpu, extra)
 
     def disable_detector(self, why: str) -> None:
         if self.detector is None:
@@ -332,6 +352,45 @@ class Recorder:
             self.torch.cuda.empty_cache()
         self.log(f"detector turned OFF: {why}")
         beep(500, 200, self.cfg.beep, times=2)
+
+    def settings_lines(self, idx: int, width: int, height: int, ffmpeg: str | None) -> list[str]:
+        """The effective settings, printed once at startup."""
+        cfg, p = self.cfg, self.cfg.policy
+        cfg.out.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(cfg.out).free / 2**30
+        saved_as = f"{cfg.height}p" if cfg.height else "native resolution"
+        quality = f" q{cfg.quality}" if cfg.ext == "jpg" else ""
+        game = "any foreground window (--any-window)" if cfg.any_window else             f"only while {', '.join(self.games)} is the foreground window"
+        ui = (f"interface screens skipped below HUD icon similarity {p.ui_threshold:g} "
+              f"({cfg.template.name if cfg.template else 'bundled template'})" if cfg.ui_filter else "interface check off")
+        if self.detector is not None:
+            det = (f"{cfg.detector.name}, imgsz {cfg.det_imgsz or 'native'}: a person at conf >= {p.det_conf:g} saves "
+                   f"every {p.det_interval:g} s, nobody seen -> base interval {p.idle_interval:g} s")
+        else:
+            det = "off (--detector weights.pt saves more often while people are seen)"
+        if self.clip is not None:
+            clips = (f"{cfg.clip_key.upper()}: {cfg.clip_fps} FPS H.264, cq {cfg.clip_cq}, stops after "
+                     f"{cfg.clip_seconds:g} s ({Path(ffmpeg).name})")
+        else:
+            clips = "unavailable: ffmpeg with ddagrab and h264_nvenc not found (PATH, IMAGEHOOK_FFMPEG or --ffmpeg)"
+        return [
+            f"ImageHook {__version__}, settings: {cfg.config or 'built-in defaults'} + command line "
+            f"(see them all: imagehook config)",
+            f"  output     {cfg.out}  ({free:.0f} GB free)",
+            f"  monitor    output {idx}, {width}x{height}; frames saved at {saved_as}, {cfg.ext.upper()}{quality}",
+            f"  game       {game}",
+            f"  filters    {ui}; duplicates below novelty {p.dup_novelty:g}",
+            f"  intervals  a check every {cfg.tick:g} s; saved after {p.min_interval:g} s for a big change, "
+            f"{p.base_interval:g} s for an average one, {p.max_interval:g} s for a still view",
+            f"  detector   {det}",
+            f"  clips      {clips}",
+            f"  limits     RAM {cfg.target_ram_gb:g}/{cfg.max_ram_gb:g} GB, VRAM {cfg.target_vram_gb:g}/"
+            f"{cfg.max_vram_gb:g} GB, own GPU {cfg.target_gpu_pct:g}/{cfg.max_gpu_pct:g}% (target/hard); session "
+            f"{cfg.max_session_gb:g} GB; stop below {cfg.min_free_gb:g} GB free",
+            f"  keys       {cfg.toggle_key.upper()} start/stop | {cfg.burst_key.upper()} burst (last "
+            f"{cfg.burst_back:g} s + next {cfg.burst_forward:g} s) | {cfg.clip_key.upper()} clip | "
+            f"{cfg.quit_key.upper()} quit",
+        ]
 
     # ------------------------------------------------------------ per-frame work
     def save(self, frame: np.ndarray, wall: datetime, reason: str, novelty: float, ui: float, det: float | None) -> bool:
@@ -355,7 +414,7 @@ class Recorder:
     def tick(self, cam) -> None:
         s = self.session
         now = time.monotonic()
-        if not self.cfg.any_window and self.fg.name() not in GAME_PROCESSES:
+        if not self.cfg.any_window and self.fg.name() not in self.games:
             s.skipped["not_game"] += 1
             return
         frame = cam.grab()
@@ -364,7 +423,7 @@ class Recorder:
             s.skipped["no_new_frame"] += 1
             return
         self.evaluations += 1
-        f = features(frame)
+        f = self.policy.features(frame)
         ui = self.policy.ui(f)
         det = None
         if self.detector is not None and ui >= self.cfg.policy.ui_threshold:
@@ -464,7 +523,8 @@ class Recorder:
 
             self.log(f"loading detector {cfg.detector.name} (imgsz {cfg.det_imgsz})...")
             self.detector = Detector(DetectorConfig(cfg.detector, cfg.det_imgsz, max_height=cfg.det_max_height,
-                                                    max_vram_gb=min(1.5, cfg.target_vram_gb)))
+                                                    max_vram_gb=min(1.5, cfg.target_vram_gb),
+                                                    icon_zone=self.layout.icon_zone))
             self.torch = self.detector.torch
             self.res.sample(self.torch)
             self.log(f"detector ready: RAM {self.res.rss:.2f} GB, VRAM {self.res.vram:.2f} GB")
@@ -472,15 +532,11 @@ class Recorder:
 
         idx = primary_output_index(bettercam) if cfg.output_idx is None else cfg.output_idx
         cam = bettercam.create(output_idx=idx, output_color="BGR")
-        self.log(f"capturing output {idx} {cam.width}x{cam.height} -> {cfg.out}  (saved height: {cfg.height or 'native'})")
         if ffmpeg := find_ffmpeg(cfg.ffmpeg):
             self.clip = ClipRecorder(ffmpeg, cfg.out, idx, cfg.clip_fps, cfg.clip_seconds, cfg.clip_cq)
-        clip_note = "" if self.clip else " (unavailable: no ffmpeg)"
-        self.log(f"{cfg.toggle_key.upper()} start/stop | {cfg.burst_key} burst (keep last {cfg.burst_back:g} s + next "
-                 f"{cfg.burst_forward:g} s) | {cfg.clip_key.upper()} video clip start/stop{clip_note} | "
-                 f"{cfg.quit_key.upper()} quit")
-        if not cfg.any_window:
-            self.log("frames are taken only while the game window is in the foreground")
+        for line in self.settings_lines(idx, cam.width, cam.height, ffmpeg):
+            print(line, flush=True)
+        self.log(f"ready: press {cfg.toggle_key.upper()} to start recording")
         if cfg.autostart:
             self.start()
         t_end = time.monotonic() + cfg.duration if cfg.duration else None

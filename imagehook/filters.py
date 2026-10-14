@@ -9,6 +9,7 @@ Per captured frame two small features are computed (a few ms at 1440p):
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
@@ -27,15 +28,48 @@ DEFAULT_TEMPLATE = Path(__file__).with_name("assets") / "hud_icon.png"
 JITTER = 0.05  # s of timing slack in interval comparisons
 
 
-def _change_mask() -> np.ndarray:
+Box = tuple[float, float, float, float]
+
+
+@lru_cache(maxsize=8)
+def _change_mask(ignore: tuple[Box, ...]) -> np.ndarray:
     w, h = THUMB_SIZE
     m = np.ones((h, w), bool)
-    for x1, y1, x2, y2 in CHANGE_IGNORE:
+    for x1, y1, x2, y2 in ignore:
         m[int(y1 * h):int(y2 * h), int(x1 * w):int(x2 * w)] = False
+    m.flags.writeable = False
     return m
 
 
-CHANGE_MASK = _change_mask()
+def check_box(name: str, box) -> Box:
+    try:
+        x1, y1, x2, y2 = (float(v) for v in box)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name}: expected [x1, y1, x2, y2], got {box!r}") from None
+    if not (0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1):
+        raise ValueError(f"{name}: {box!r} is not a box inside the frame (0 <= x1 < x2 <= 1, 0 <= y1 < y2 <= 1)")
+    return x1, y1, x2, y2
+
+
+@dataclass(frozen=True)
+class HudLayout:
+    """Where the game's HUD is, as normalized (x1, y1, x2, y2) boxes. The defaults fit the default HUD at 16:9.
+    icon_zone: the body-status icon that only gameplay frames have (interface check, ignored by the detector).
+    change_ignore: areas that change on their own and are ignored when measuring scene change."""
+    icon_zone: Box = ICON_ZONE
+    change_ignore: tuple[Box, ...] = CHANGE_IGNORE
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "icon_zone", check_box("icon_zone", self.icon_zone))
+        object.__setattr__(self, "change_ignore", tuple(check_box("change_ignore", b) for b in self.change_ignore))
+
+    @property
+    def change_mask(self) -> np.ndarray:
+        return _change_mask(self.change_ignore)
+
+
+DEFAULT_LAYOUT = HudLayout()
+CHANGE_MASK = DEFAULT_LAYOUT.change_mask
 
 
 @dataclass
@@ -44,11 +78,11 @@ class Features:
     icon: np.ndarray  # float32 (92, 68)
 
 
-def features(frame: np.ndarray) -> Features:
+def features(frame: np.ndarray, layout: HudLayout = DEFAULT_LAYOUT) -> Features:
     """BGR (or grayscale) frame of any 16:9 size -> Features."""
     gray = frame if frame.ndim == 2 else None
     h, w = frame.shape[:2]
-    x1, y1, x2, y2 = ICON_ZONE
+    x1, y1, x2, y2 = layout.icon_zone
     icon = frame[int(y1 * h):int(y2 * h), int(x1 * w):int(x2 * w)]
     thumb = cv2.resize(frame, THUMB_SIZE, interpolation=cv2.INTER_AREA)
     if gray is None:
@@ -79,13 +113,13 @@ def ui_score(icon: np.ndarray, template: np.ndarray) -> float:
     return float(cv2.matchTemplate(icon, template, cv2.TM_CCOEFF_NORMED)[0, 0])
 
 
-def change(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
-    """(global, local) change between two thumbs, HUD areas ignored.
+def change(a: np.ndarray, b: np.ndarray, mask: np.ndarray = CHANGE_MASK) -> tuple[float, float]:
+    """(global, local) change between two thumbs, HUD areas (False in `mask`) ignored.
     global: mean absolute grayscale difference (0..255); camera turns give 20-50, a still view 1-5.
     local: largest share of changed pixels in one 20x20 cell (0..1); catches something moving in a still view."""
     d = np.abs(a.astype(np.int16) - b.astype(np.int16))
-    g = float(d[CHANGE_MASK].mean())
-    changed = (d > LOCAL_DIFF) & CHANGE_MASK
+    g = float(d[mask].mean())
+    changed = (d > LOCAL_DIFF) & mask
     h, w = changed.shape
     c = LOCAL_CELL
     local = float(changed[: h // c * c, : w // c * c].reshape(h // c, c, w // c, c).mean(axis=(1, 3)).max())
@@ -124,9 +158,10 @@ class CapturePolicy:
     With a detector, frames where nobody is seen use idle_interval as the base, and a hit (held for det_hold s)
     saves a non-duplicate frame every det_interval."""
 
-    def __init__(self, cfg: PolicyConfig, template: np.ndarray | None):
+    def __init__(self, cfg: PolicyConfig, template: np.ndarray | None, layout: HudLayout = DEFAULT_LAYOUT):
         self.cfg = cfg
         self.template = template
+        self.layout = layout
         self.last: np.ndarray | None = None
         self.last_t = -1e18
         self.hit_until = -1e18
@@ -134,13 +169,16 @@ class CapturePolicy:
     def reset(self) -> None:
         self.last, self.last_t, self.hit_until = None, -1e18, -1e18
 
+    def features(self, frame: np.ndarray) -> Features:
+        return features(frame, self.layout)
+
     def ui(self, f: Features) -> float:
         return 1.0 if self.template is None else ui_score(f.icon, self.template)
 
     def novelty(self, f: Features) -> float:
         if self.last is None:
             return float("inf")
-        g, local = change(self.last, f.thumb)
+        g, local = change(self.last, f.thumb, self.layout.change_mask)
         return max(g / self.cfg.global_ref, local / self.cfg.local_ref)
 
     def evaluate(self, now: float, f: Features, det_conf: float | None = None, burst: bool = False,

@@ -23,7 +23,7 @@ import cv2
 import numpy as np
 
 from .detector import relevant_conf
-from .filters import CapturePolicy, Features, features
+from .filters import DEFAULT_LAYOUT, CapturePolicy, Features, HudLayout, features
 
 IMG_EXT = {".jpg", ".jpeg", ".png"}
 NAME_RE = re.compile(r"^(\d{2})(\d{2})(\d{2})_(\d{3})$")
@@ -83,7 +83,7 @@ class ReplayResult:
         return [n for n, s, _ in self.decisions if s]
 
 
-def read_det_labels(path: Path, max_height: float) -> float:
+def read_det_labels(path: Path, max_height: float, layout: HudLayout = DEFAULT_LAYOUT) -> float:
     """YOLO txt with a confidence column (prelabel output) -> relevant max confidence."""
     if not path.exists():
         return 0.0
@@ -93,10 +93,11 @@ def read_det_labels(path: Path, max_height: float) -> float:
         if len(v) >= 6:
             boxes.append(tuple(map(float, v[1:5])))
             confs.append(float(v[5]))
-    return relevant_conf(boxes, confs, max_height)
+    return relevant_conf(boxes, confs, max_height, layout.icon_zone)
 
 
-def iter_session(session: Path, det_labels: Path | None, det_max_height: float, full: bool) -> Iterator[Item]:
+def iter_session(session: Path, det_labels: Path | None, det_max_height: float, full: bool,
+                 layout: HudLayout = DEFAULT_LAYOUT) -> Iterator[Item]:
     frames_dir = session / "frames" if (session / "frames").is_dir() else session
     sess_dir = frames_dir.parent if frames_dir.name == "frames" else frames_dir
     frames = ordered_frames(frames_dir, session_start_seconds(sess_dir))
@@ -105,15 +106,15 @@ def iter_session(session: Path, det_labels: Path | None, det_max_height: float, 
     def load(tp: tuple[float, Path]) -> Item:
         t, p = tp
         img = cv2.imread(str(p), flag)
-        det = read_det_labels(det_labels / f"{p.stem}.txt", det_max_height) if det_labels else None
-        return Item(t, p.stem, features(img), det, p, img if full else None)
+        det = read_det_labels(det_labels / f"{p.stem}.txt", det_max_height, layout) if det_labels else None
+        return Item(t, p.stem, features(img, layout), det, p, img if full else None)
 
     with ThreadPoolExecutor(4) as ex:
         for i in range(0, len(frames), 64):  # bounded read-ahead
             yield from ex.map(load, frames[i:i + 64])
 
 
-def iter_video(path: Path, tick: float, start: datetime) -> Iterator[Item]:
+def iter_video(path: Path, tick: float, start: datetime, layout: HudLayout = DEFAULT_LAYOUT) -> Iterator[Item]:
     cap = cv2.VideoCapture(str(path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     idx, next_t = 0, 0.0
@@ -131,7 +132,7 @@ def iter_video(path: Path, tick: float, start: datetime) -> Iterator[Item]:
                 return
             next_t = t + tick
             wall = start + timedelta(seconds=t)
-            yield Item(t, f"{wall:%H%M%S}_{wall.microsecond // 1000:03d}", features(frame), frame=frame)
+            yield Item(t, f"{wall:%H%M%S}_{wall.microsecond // 1000:03d}", features(frame, layout), frame=frame)
     finally:
         cap.release()
 

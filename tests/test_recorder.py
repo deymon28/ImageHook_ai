@@ -56,3 +56,25 @@ def test_interface_frames_are_not_buffered_for_bursts(tmp_path, monkeypatch):
     rec.tick(cam), rec.tick(cam)
     assert rec.session.skipped["ui"] == 2 and not rec.ring and rec.session.n_saved == 0
     rec.close_session()
+
+
+def test_settings_block_and_status_line(tmp_path, monkeypatch):
+    rec = Recorder(RecordConfig(out=tmp_path, beep=False, game_processes=("Game.EXE",), config="imagehook.toml"))
+    lines = rec.settings_lines(0, 2560, 1440, None)
+    text = "\n".join(lines)
+    assert lines[0].startswith("ImageHook ") and "imagehook.toml" in lines[0]
+    assert "game.exe is the foreground window" in text and "2560x1440" in text
+    assert "detector   off" in text and "clips      unavailable" in text
+    rec.start()
+    cam = FakeCam([scene(1, 360, 640), scene(2, 360, 640, icon=False)])
+    clock = iter([0.0, 0.5, 1.0])
+    monkeypatch.setattr("imagehook.capture.time.monotonic", lambda: next(clock))
+    monkeypatch.setattr(rec.fg, "name", lambda: "game.exe")
+    rec.tick(cam), rec.tick(cam)
+    rec.rec_seconds = 61.0
+    line = rec.status_line()
+    assert line.startswith("REC 0:01:01 | saved 1: first 1 | skipped of 2 checks: ui 50.0%")
+    monkeypatch.setattr(rec.fg, "name", lambda: "explorer.exe")
+    rec.tick(cam)
+    assert rec.session.skipped["not_game"] == 1
+    rec.close_session()

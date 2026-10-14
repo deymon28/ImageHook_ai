@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .filters import ICON_ZONE
+from .filters import ICON_ZONE, Box
 
 
 @dataclass
@@ -21,11 +21,13 @@ class DetectorConfig:
     conf: float = 0.1  # proposals below this are not even reported; the policy threshold is PolicyConfig.det_conf
     max_height: float = 0.15  # ignore boxes taller than this share of the frame: close people matter little
     max_vram_gb: float = 1.0  # PyTorch allocator cap (the CUDA context comes on top)
+    icon_zone: Box = ICON_ZONE  # detections on the HUD body icon are ignored
 
 
-def relevant_conf(boxes_xywhn: list[tuple[float, float, float, float]], confs: list[float], max_height: float) -> float:
+def relevant_conf(boxes_xywhn: list[tuple[float, float, float, float]], confs: list[float], max_height: float,
+                  icon_zone: Box = ICON_ZONE) -> float:
     """Max confidence over boxes that are not the HUD body icon and not taller than max_height (0 if none)."""
-    x1, y1, x2, y2 = ICON_ZONE
+    x1, y1, x2, y2 = icon_zone
     best = 0.0
     for (cx, cy, _bw, bh), c in zip(boxes_xywhn, confs):
         if x1 <= cx <= x2 and y1 <= cy <= y2:
@@ -58,7 +60,7 @@ class Detector:
         imgsz = self.cfg.imgsz or max(frame_bgr.shape[:2])
         r = self.model.predict(frame_bgr, imgsz=imgsz, conf=self.cfg.conf, quantize=16, device=0,
                                max_det=50, verbose=False)[0]
-        return relevant_conf(r.boxes.xywhn.tolist(), r.boxes.conf.tolist(), self.cfg.max_height)
+        return relevant_conf(r.boxes.xywhn.tolist(), r.boxes.conf.tolist(), self.cfg.max_height, self.cfg.icon_zone)
 
     def vram_peak_gb(self) -> float:
         return self.torch.cuda.max_memory_reserved() / 2**30
