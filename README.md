@@ -1,23 +1,15 @@
 # ImageHook
 
-Light gameplay frame recorder for building person-detection datasets for Arena Breakout Infinite (`UAGame.exe`).
-It captures the monitor via DXGI while you play and saves only frames worth labeling. It skips interface screens
-(inventory, map, loading, death and extraction screens), near-duplicates and long still scenes, and records more
-often when the scene changes or a person is detected. It can also record short native-resolution video clips, so
-that models can be compared on the same real footage (`screendet run --source clip.mp4`).
+Light gameplay frame recorder for building person-detection datasets from your own game sessions. It captures the
+monitor via DXGI while you play and saves only frames worth labeling. It skips interface screens (menus, map,
+loading screens), near-duplicates and long still scenes, and records more often when the scene changes or a person
+is detected. It can also record short native-resolution video clips, so that models can be compared on the same
+real footage.
 
-It is one part of a three-project system:
+Sessions are plain folders of JPEG frames named by time of day, ready for a labeling tool that turns them into a
+YOLO dataset.
 
-| Project | Role |
-|---|---|
-| **ImageHook** (this repository) | records gameplay frames into session folders |
-| **ImageClassfication** | labeling app: turns sessions into a YOLO dataset |
-| **fin_snip_helper** (`screendet`) | real-time detection, training, model comparison |
-
-ImageHook grew out of `fin_snip_helper/tools/collect_frames.py` and keeps its output format, so sessions can be
-labeled by either labeling tool.
-
-**Contents:** [Quick start](#quick-start) · [Keys](#keys) · [Settings](#settings) ·
+**Contents:** [Quick start](#quick-start) · [Game profile](#game-profile) · [Keys](#keys) · [Settings](#settings) ·
 [What the console shows](#what-the-console-shows) · [Looking at sessions](#looking-at-sessions-imagehook-info) ·
 [Output format](#output-format) · [How frames are chosen](#how-frames-are-chosen) ·
 [Optional detector](#optional-detector) · [Video clips](#video-clips) · [Resource use](#resource-use) ·
@@ -34,7 +26,8 @@ python -m venv .venv --system-site-packages
 ```
 
 Start the game in windowed or borderless mode, press `F8` to start recording and `F9` to quit. When a session is
-closed, a summary is printed; `imagehook info` shows it again later. All commands:
+closed, a summary is printed; `imagehook info` shows it again later. Without a [game profile](#game-profile) every
+foreground window is recorded and interface screens are not filtered. All commands:
 
 | Command | What it does |
 |---|---|
@@ -42,7 +35,7 @@ closed, a summary is printed; `imagehook info` shows it again later. All command
 | `imagehook info [SESSION]` | a table of all sessions, or the details of one |
 | `imagehook replay SESSION` | runs a recorded session or a video through the filters, without the game |
 | `imagehook clip` | records one video clip |
-| `imagehook template SESSION...` | rebuilds the HUD icon template after HUD changes |
+| `imagehook template SESSION...` | builds the HUD icon template for the interface check |
 | `imagehook config` | shows the settings in effect; `--init` creates `imagehook.toml` |
 
 `imagehook` stands for `.venv\Scripts\python -m imagehook`. Every command has `--help`, which shows the defaults
@@ -55,6 +48,27 @@ Optional parts:
 * video clips need ffmpeg 6 or newer with the `ddagrab` filter and the `h264_nvenc` encoder (for example a "gpl"
   Windows build), on `PATH`, in `IMAGEHOOK_FFMPEG`, or passed with `--ffmpeg`. Without ffmpeg, frame recording
   still works.
+
+## Game profile
+
+Two settings tie the recorder to one game. Put them in your `imagehook.toml` (see [Settings](#settings)):
+
+```toml
+[game]
+game_processes = ["game.exe"]          # frames only while this process owns the foreground window
+template = "profiles/hud_icon.png"     # HUD icon template: turns the interface check on
+```
+
+The template is the median of a HUD icon that only gameplay frames show (bottom-left corner by default,
+`icon_zone`). Build it from one or two sessions recorded without it, mostly gameplay:
+
+```
+.venv\Scripts\python -m imagehook record                       # first sessions: no interface check yet
+.venv\Scripts\python -m imagehook template path\to\session --out profiles\hud_icon.png
+```
+
+Keep game-specific files in `profiles/`; Git ignores that folder and `imagehook.toml`. If the game's HUD icon is
+elsewhere, set `icon_zone` (and `change_ignore`) first, see [the HUD layout](#settings).
 
 ## Keys
 
@@ -73,7 +87,8 @@ game does not use. Key names: `f1`..`f24`, `a`..`z`, `0`..`9`, `numpad0`..`numpa
 Beeps confirm the keys: high = started, middle = stopped, short high = burst, two short = clip started/saved, three
 low = recording stopped on its own because of a limit (or could not start).
 
-Frames are taken only while the game window is in the foreground (`any_window` turns this off). Recording stops
+With `game_processes` set, frames are taken only while the game window is in the foreground (`any_window` turns
+this off). Recording stops
 when a session reaches 20 GB (`max_session_gb`; the next start opens a new session) or the disk has less than
 20 GB free (`min_free_gb`).
 
@@ -100,7 +115,8 @@ Example:
 out = "D:/captures"
 
 [game]
-game_processes = ["uagame.exe"]
+game_processes = ["game.exe"]
+template = "profiles/hud_icon.png"
 
 [keys]
 burst_key = "mouse4"
@@ -121,8 +137,8 @@ ui_threshold = 0.25
 | `[run]` | `autostart`, `duration` |
 
 The **HUD layout** describes where the game's HUD is, as normalized `[x1, y1, x2, y2]` boxes of a 16:9 frame:
-`icon_zone` is the body-status icon in the bottom-left corner (only gameplay frames have it), `change_ignore` are
-the areas that change on their own (FPS/ping overlay, chat, weapon panel, stamina bar). Change them if the HUD
+`icon_zone` is a HUD icon in the bottom-left corner that only gameplay frames have, `change_ignore` are the areas
+that change on their own (FPS/ping overlay, chat, side panels, status bars). Change them if the HUD
 layout or scale changes, then rebuild the template with `imagehook template`. The settings file of `record` also
 applies to `replay` and `template`, so offline checks use the same filters; only `record` uses `detector`.
 
@@ -134,8 +150,8 @@ At startup `record` prints the settings in effect:
 ImageHook 0.2.0, settings: imagehook.toml + command line (see them all: imagehook config)
   output     D:\captures  (412 GB free)
   monitor    output 0, 2560x1440; frames saved at native resolution, JPG q95
-  game       only while uagame.exe is the foreground window
-  filters    interface screens skipped below HUD icon similarity 0.3 (bundled template); duplicates below novelty 0.15
+  game       only while game.exe is the foreground window
+  filters    interface screens skipped below HUD icon similarity 0.3 (hud_icon.png); duplicates below novelty 0.15
   intervals  a check every 0.5 s; saved after 0.5 s for a big change, 1 s for an average one, 10 s for a still view
   detector   off (--detector weights.pt saves more often while people are seen)
   clips      F7: 30 FPS H.264, cq 19, stops after 120 s (ffmpeg.exe)
@@ -180,8 +196,8 @@ session_20261011_220514   (imagehook 0.1.0)
   labels     pos 736 (13.4%), neg 2,682 (48.7%), skip 287 (5.2%), unlabeled 1,485 (27.0%), todo 317 (5.8%)
 ```
 
-The same summary is printed when a session is closed. `labels` comes from the labeling app's `review.json`.
-Sessions of the old collector (no `capture.json`) show only frames, gaps and labels. `--json` prints the numbers
+The same summary is printed when a session is closed. `labels` comes from the labeling tool's `review.json`.
+Sessions recorded by other tools (no `capture.json`) show only frames, gaps and labels. `--json` prints the numbers
 for scripts.
 
 ## Output format
@@ -194,8 +210,7 @@ for scripts.
 ```
 
 Frames are saved at the native monitor resolution (2560x1440 on a 1440p monitor) as JPEG quality 95, about
-0.7–1.5 MB per gameplay frame (0.71 MB on average in a real 2 h session). `height = 1080` scales them down like the
-old collector did. The output root is `./captures` by default (`out` or the `IMAGEHOOK_OUT` environment variable).
+0.7–1.5 MB per gameplay frame (0.71 MB on average in a real 2 h session). `height = 1080` scales them down. The output root is `./captures` by default (`out` or the `IMAGEHOOK_OUT` environment variable).
 
 Video clips go to `<out>/clips/clip_YYYYmmdd_HHMMSS.mp4`: H.264, native resolution, 30 FPS.
 
@@ -203,9 +218,9 @@ Video clips go to `<out>/clips/clip_YYYYmmdd_HHMMSS.mp4`: H.264, native resoluti
 
 The recorder checks a frame every 0.5 s. Each check computes two small features in a few milliseconds:
 
-* **Interface check**: an interface screen has no body-status silhouette icon in the bottom-left HUD corner. That
-  area (`icon_zone`) is compared with a template (`imagehook/assets/hud_icon.png`, the median icon of about 9,400
-  recorded frames). If the similarity is below 0.3 (`ui_threshold`), the frame is skipped (`ui`).
+* **Interface check**: an interface screen does not have the HUD icon that gameplay frames show in the bottom-left
+  corner. That area (`icon_zone`) is compared with a template (`template`, the median icon of many recorded
+  gameplay frames, built with `imagehook template`; see [Game profile](#game-profile)). If the similarity is below 0.3 (`ui_threshold`), the frame is skipped (`ui`).
 * **Novelty**: a 320x180 grayscale thumbnail is compared with the last *saved* frame. HUD areas that change by
   themselves (`change_ignore`) are ignored.
   `novelty = max(mean difference / 15, largest share of changed pixels in a 20x20 cell / 0.6)` (`global_ref`,
@@ -233,11 +248,11 @@ In the first live session (2 h 13 min, 2026-10-11) 35% of the checked frames wer
 
 `--detector weights.pt` (or `detector` in the settings) loads a YOLO model with PyTorch (never TensorRT) at
 startup. It runs on each checked frame that is not an interface screen, at native resolution (`imgsz` 2560 at
-1440p, like `screendet`; `det_imgsz`) with FP16. If the tool's own GPU load goes above 20%, the detector runs only
+1440p; `det_imgsz`) with FP16. If the tool's own GPU load goes above 20%, the detector runs only
 on every 2nd, 4th or 8th checked frame. If the load still stays above 30%, the detector is turned off. The detector
 **never drops frames**: a person with confidence ≥ 0.2 (`det_conf`) makes the recorder save more often, and while
 it sees nobody the base interval becomes 2 s (`idle_interval`). Boxes taller than 15% of the frame
-(`det_max_height`) are ignored, because close targets matter least. Detections on the HUD body icon are ignored too.
+(`det_max_height`) are ignored, because close targets matter least. Detections on the HUD icon are ignored too.
 
 ## Video clips
 
@@ -249,7 +264,7 @@ Press `F7` during `record`, or run it standalone:
 
 ffmpeg captures and encodes on the GPU: `ddagrab` (DXGI duplication into D3D11 memory) feeds `h264_nvenc`, the
 dedicated video encoder. No frame passes through Python, and the CPU load stays negligible. Clips are H.264 Main
-4:2:0, which OpenCV reads directly. Pass a clip to `screendet run --source clip.mp4`, or check the filters on it with
+4:2:0, which OpenCV reads directly. Use a clip as a test video for a detector, or check the filters on it with
 `imagehook replay clip.mp4`. Clip size depends on the scene: about 6 Mbit/s for a mostly still desktop, noticeably
 more for gameplay at the default quality (`clip_cq = 19`). Plan for a few hundred MB per minute.
 
@@ -304,7 +319,7 @@ If the session is labeled (`review.json` with `pos`/`neg`/`skip`, plus `labels/`
 per status. It also checks that every frame with people still has a kept frame with people within ±2 s
 (`small` counts only people under 40 px at 1080p). `--json` prints the report as JSON.
 
-Results on two sessions recorded with the old collector (9,400 frames at 1 s intervals, already without static
+Results on two earlier sessions (9,400 frames recorded at 1 s intervals, already without static
 frames). The 0.5 s rule cannot be replayed on 1 s data:
 
 | Mode | Kept | People frames kept | Interface/unusable (`skip`) kept | People covered (±2 s) | Small people covered |
@@ -315,8 +330,8 @@ frames). The 0.5 s rule cannot be replayed on 1 s data:
 Of the 1,895 frames rejected as interface screens, the labeled ones with people are menu, loading and lobby screens
 with character models.
 
-`template` rebuilds the HUD icon template from sessions that are mostly gameplay. Use it if the HUD scale or layout
-changes:
+`template` builds the HUD icon template from sessions that are mostly gameplay (see
+[Game profile](#game-profile)). Rebuild it if the HUD scale or layout changes:
 
 ```
 .venv\Scripts\python -m imagehook template path\to\session1 path\to\session2

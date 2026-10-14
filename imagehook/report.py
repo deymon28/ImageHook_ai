@@ -19,7 +19,7 @@ SAVED_REASONS = {
     "burst": "kept by the burst key",
 }
 SKIPPED_REASONS = {
-    "ui": "interface screen (no HUD body icon): inventory, map, loading, death or extraction screen",
+    "ui": "interface screen (no HUD icon): menus, map, loading screens",
     "duplicate": "almost the same as the last saved frame",
     "waiting": "changed too little for the time since the last saved frame (kept 10 s for a burst)",
     "not_game": "the game was not the foreground window (not evaluated)",

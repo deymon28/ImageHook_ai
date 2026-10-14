@@ -3,8 +3,8 @@ shared by the live recorder and the offline replay.
 
 Per captured frame two small features are computed (a few ms at 1440p):
   thumb  320x180 grayscale, used to measure how much the scene changed since the last saved frame
-  icon   the bottom-left body-status HUD icon area, normalized to 68x92 (the 540p size of the template); interface
-         screens (inventory, map, loading, death/extraction screens) do not have this icon
+  icon   a HUD icon area that is visible only during gameplay, normalized to 68x92 (the 540p size of the template);
+         interface screens (menus, map, loading screens) do not have this icon
 """
 from __future__ import annotations
 
@@ -17,14 +17,13 @@ import numpy as np
 
 THUMB_SIZE = (320, 180)  # (w, h)
 ICON_SIZE = (68, 92)  # (w, h): the icon zone of a 960x540 frame
-# normalized (x1, y1, x2, y2) area of the body-status silhouette icon, same zone as the labeling tool's HUD_ZONES
+# normalized (x1, y1, x2, y2) area of the HUD icon that only gameplay frames have (bottom-left corner)
 ICON_ZONE = (0.0, 0.75, 0.07, 0.92)
-# HUD areas that change on their own (FPS/ping/timer/perf overlay at the top, chat and body icon bottom-left,
-# weapon bottom-right, stamina bar bottom-centre): ignored when measuring scene change
+# HUD areas that change on their own (FPS/ping/timer overlay at the top, chat and the icon bottom-left, panels
+# bottom-right, a status bar bottom-centre): ignored when measuring scene change
 CHANGE_IGNORE = ((0.0, 0.0, 1.0, 0.05), (0.0, 0.93, 1.0, 1.0), (0.0, 0.55, 0.22, 1.0), (0.85, 0.8, 1.0, 1.0))
 LOCAL_CELL = 20  # thumb pixels per side of a local-change cell (16x9 grid)
 LOCAL_DIFF = 20  # grayscale difference that counts a thumb pixel as changed
-DEFAULT_TEMPLATE = Path(__file__).with_name("assets") / "hud_icon.png"
 JITTER = 0.05  # s of timing slack in interval comparisons
 
 
@@ -54,7 +53,7 @@ def check_box(name: str, box) -> Box:
 @dataclass(frozen=True)
 class HudLayout:
     """Where the game's HUD is, as normalized (x1, y1, x2, y2) boxes. The defaults fit the default HUD at 16:9.
-    icon_zone: the body-status icon that only gameplay frames have (interface check, ignored by the detector).
+    icon_zone: the HUD icon that only gameplay frames have (interface check, ignored by the detector).
     change_ignore: areas that change on their own and are ignored when measuring scene change."""
     icon_zone: Box = ICON_ZONE
     change_ignore: tuple[Box, ...] = CHANGE_IGNORE
@@ -92,7 +91,7 @@ def features(frame: np.ndarray, layout: HudLayout = DEFAULT_LAYOUT) -> Features:
     return Features(thumb=thumb, icon=icon)
 
 
-def load_template(path: Path = DEFAULT_TEMPLATE) -> np.ndarray:
+def load_template(path: Path) -> np.ndarray:
     tmpl = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
     if tmpl is None:
         raise FileNotFoundError(f"HUD icon template not found: {path}")

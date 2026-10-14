@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import config
-from .filters import CHANGE_IGNORE, DEFAULT_TEMPLATE, ICON_ZONE, HudLayout, PolicyConfig
+from .filters import CHANGE_IGNORE, ICON_ZONE, HudLayout, PolicyConfig
 
 PROJECT = config.PROJECT
 DEFAULT_OUT = Path(os.environ.get("IMAGEHOOK_OUT", PROJECT / "captures"))
@@ -33,7 +33,7 @@ def add_policy_args(ap: argparse.ArgumentParser) -> None:
     g = ap.add_argument_group("filters (a frame is saved when novelty x seconds since the last save >= base interval)")
     g.add_argument("--ui-threshold", type=float, default=d.ui_threshold, help="HUD icon similarity below this = interface screen, skipped")
     g.add_argument("--no-ui-filter", action="store_true", help="keep interface screens too")
-    g.add_argument("--template", type=Path, help=f"HUD icon template PNG; not set = the bundled {DEFAULT_TEMPLATE.name}")
+    g.add_argument("--template", type=Path, help="HUD icon template PNG (imagehook template builds one); not set = no interface check")
     g.add_argument("--dup-novelty", type=float, default=d.dup_novelty, help="novelty below this = duplicate of the last saved frame, never saved")
     g.add_argument("--min-interval", type=float, default=d.min_interval, help="s: a frame is checked this often, and no two saved frames are closer")
     g.add_argument("--base-interval", type=float, default=d.base_interval, help="s: an average change (novelty 1) is saved about this often")
@@ -51,7 +51,7 @@ def add_policy_args(ap: argparse.ArgumentParser) -> None:
 def add_layout_args(ap: argparse.ArgumentParser) -> None:
     g = ap.add_argument_group("HUD layout (normalized 0..1 boxes of a 16:9 frame; usually set in imagehook.toml)")
     g.add_argument("--icon-zone", type=float, nargs=4, default=list(ICON_ZONE), metavar=("X1", "Y1", "X2", "Y2"),
-                   help="HUD body-status icon used by the interface check")
+                   help="HUD icon used by the interface check")
     g.add_argument("--change-ignore", type=config.boxes, default=CHANGE_IGNORE, metavar="JSON",
                    help="areas that change on their own, a JSON list of [x1, y1, x2, y2] boxes")
 
@@ -94,8 +94,8 @@ def cmd_replay(a: argparse.Namespace) -> None:
     from .replay import iter_session, iter_video, label_report, replay
 
     layout = layout_from(a)
-    policy = CapturePolicy(policy_from(a), None if a.no_ui_filter else load_template(a.template or DEFAULT_TEMPLATE),
-                           layout)
+    template = load_template(a.template) if a.template and not a.no_ui_filter else None
+    policy = CapturePolicy(policy_from(a), template, layout)
     detector = None
     if a.replay_detector:
         from .detector import Detector, DetectorConfig
@@ -356,7 +356,7 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argument
     t = sub.add_parser("template", formatter_class=fmt,
                        help="rebuild the HUD icon template from recorded sessions (mostly gameplay)")
     t.add_argument("sessions", type=Path, nargs="+", help="session folders, mostly gameplay")
-    t.add_argument("--out", dest="template_out", type=Path, default=DEFAULT_TEMPLATE, help="template PNG to write")
+    t.add_argument("--out", dest="template_out", type=Path, default=Path("hud_icon.png"), help="template PNG to write")
     t.add_argument("--every", type=int, default=10, help="use every N-th frame")
     add_layout_args(t)
     t.set_defaults(func=cmd_template)

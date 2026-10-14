@@ -49,8 +49,8 @@ def test_change_ignores_hud_areas():
     base = scene(6)
     hud = base.copy()
     hud[0:60, :] = 255  # top overlay: FPS, timer, perf counters
-    hud[1400:, :] = 0  # stamina bar
-    hud[1300:1440, 2300:2560] = 128  # weapon panel
+    hud[1400:, :] = 0  # bottom status bar
+    hud[1300:1440, 2300:2560] = 128  # bottom-right panel
     assert change(features(base).thumb, features(hud).thumb) == (0.0, 0.0)
 
 

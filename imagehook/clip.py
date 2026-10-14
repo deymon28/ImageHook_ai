@@ -1,4 +1,4 @@
-"""Native-resolution gameplay clips for comparing models on the same real footage (`screendet run --source clip.mp4`).
+"""Native-resolution gameplay clips, for example to compare detection models on the same real footage.
 
 ffmpeg does the whole job on the GPU: `ddagrab` (DXGI desktop duplication, frames stay in D3D11 memory) feeds
 `h264_nvenc` (the dedicated video encoder, not the shader cores), so the CPU only runs a small ffmpeg process and

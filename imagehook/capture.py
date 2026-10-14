@@ -24,7 +24,7 @@ from .clip import ClipRecorder, find_ffmpeg
 from .hotkeys import Keys, beep, parse_key
 from .session import Session
 
-GAME_PROCESSES = ("uagame.exe",)  # Arena Breakout Infinite
+GAME_PROCESSES: tuple[str, ...] = ()  # set game_processes in imagehook.toml; empty = any foreground window
 
 
 @dataclass
@@ -42,11 +42,11 @@ class RecordConfig:
     burst_back: float = 10.0  # a burst also keeps the unsaved frames of the last N seconds
     burst_forward: float = 5.0  # ...and every non-duplicate frame for the next N seconds
     any_window: bool = False  # record even when the game is not the foreground window
-    game_processes: tuple[str, ...] = GAME_PROCESSES  # executable names (lower case) of the game window
+    game_processes: tuple[str, ...] = GAME_PROCESSES  # executable names of the game window; empty = any window
     icon_zone: Box = ICON_ZONE  # HUD layout, see filters.HudLayout
     change_ignore: tuple[Box, ...] = CHANGE_IGNORE
     ui_filter: bool = True
-    template: Path | None = None
+    template: Path | None = None  # HUD icon template; without one the interface check is off
     max_session_gb: float = 20.0
     min_free_gb: float = 20.0
     target_ram_gb: float = 2.0  # going over a target only prints a warning
@@ -59,7 +59,7 @@ class RecordConfig:
     autostart: bool = False
     duration: float | None = None
     detector: Path | None = None
-    det_imgsz: int = 0  # 0 = native (the frame's long side), like screendet
+    det_imgsz: int = 0  # 0 = native (the frame's long side)
     det_max_height: float = 0.15
     ffmpeg: str | None = None
     clip_fps: int = 30
@@ -236,10 +236,10 @@ class Recorder:
         self.keys = Keys()
         self.vk_toggle, self.vk_quit, self.vk_burst, self.vk_clip = (
             parse_key(k) for k in (cfg.toggle_key, cfg.quit_key, cfg.burst_key, cfg.clip_key))
-        template = load_template(cfg.template) if cfg.template else load_template()
+        template = load_template(cfg.template) if cfg.template and cfg.ui_filter else None
         self.layout = HudLayout(tuple(cfg.icon_zone), tuple(tuple(b) for b in cfg.change_ignore))
         self.games = tuple(g.lower() for g in cfg.game_processes)
-        self.policy = CapturePolicy(cfg.policy, template if cfg.ui_filter else None, self.layout)
+        self.policy = CapturePolicy(cfg.policy, template, self.layout)
         self.fg = Foreground()
         self.res = Resources()
         self.session: Session | None = None
@@ -360,9 +360,16 @@ class Recorder:
         free = shutil.disk_usage(cfg.out).free / 2**30
         saved_as = f"{cfg.height}p" if cfg.height else "native resolution"
         quality = f" q{cfg.quality}" if cfg.ext == "jpg" else ""
-        game = "any foreground window (--any-window)" if cfg.any_window else             f"only while {', '.join(self.games)} is the foreground window"
-        ui = (f"interface screens skipped below HUD icon similarity {p.ui_threshold:g} "
-              f"({cfg.template.name if cfg.template else 'bundled template'})" if cfg.ui_filter else "interface check off")
+        if cfg.any_window or not self.games:
+            game = "any foreground window" + (" (--any-window)" if cfg.any_window else " (set game_processes to limit it)")
+        else:
+            game = f"only while {', '.join(self.games)} is the foreground window"
+        if self.policy.template is not None:
+            ui = f"interface screens skipped below HUD icon similarity {p.ui_threshold:g} ({cfg.template.name})"
+        elif cfg.ui_filter:
+            ui = "interface check off: no HUD template (set template; build one with: imagehook template)"
+        else:
+            ui = "interface check off (--no-ui-filter)"
         if self.detector is not None:
             det = (f"{cfg.detector.name}, imgsz {cfg.det_imgsz or 'native'}: a person at conf >= {p.det_conf:g} saves "
                    f"every {p.det_interval:g} s, nobody seen -> base interval {p.idle_interval:g} s")
@@ -396,7 +403,7 @@ class Recorder:
     def save(self, frame: np.ndarray, wall: datetime, reason: str, novelty: float, ui: float, det: float | None) -> bool:
         h = self.cfg.height
         if h and frame.shape[0] != h:
-            # bilinear without antialiasing, like the detector's GPU resize in screendet
+            # bilinear without antialiasing, like a GPU resize in a detector pipeline
             frame = cv2.resize(frame, (round(frame.shape[1] * h / frame.shape[0]), h), interpolation=cv2.INTER_LINEAR)
         if self.session.save(frame, wall, reason, novelty, ui, det) is None:
             self.log("disk writer is behind, frame dropped")
@@ -414,7 +421,7 @@ class Recorder:
     def tick(self, cam) -> None:
         s = self.session
         now = time.monotonic()
-        if not self.cfg.any_window and self.fg.name() not in self.games:
+        if not self.cfg.any_window and self.games and self.fg.name() not in self.games:
             s.skipped["not_game"] += 1
             return
         frame = cam.grab()

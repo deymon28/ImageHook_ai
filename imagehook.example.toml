@@ -15,14 +15,16 @@
 # min_free_gb = 20.0            # recording stops when the output disk has less free space
 
 [game]
-# game_processes = ["uagame.exe"]   # frames are taken only while one of these is the foreground window
+# game_processes = []             # e.g. ["game.exe"]: frames only while one of these is the foreground window;
+#                                 # empty = any foreground window
 # any_window = false                # true: take frames whatever window is in front
 # no_ui_filter = false              # true: keep interface screens too
-# template = "imagehook/assets/hud_icon.png"   # HUD icon template (rebuild it with: imagehook template)
+# template = "profiles/hud_icon.png"   # HUD icon template (build it with: imagehook template); not set = no
+#                                     # interface check. profiles/ is ignored by Git: keep game files there.
 # Normalized [x1, y1, x2, y2] boxes of the 16:9 frame (0..1). Change them if the HUD layout or scale changes.
-# icon_zone = [0.0, 0.75, 0.07, 0.92]     # body-status icon: present only in gameplay; detections on it are ignored
+# icon_zone = [0.0, 0.75, 0.07, 0.92]     # HUD icon present only in gameplay; detections on it are ignored
 # change_ignore = [[0.0, 0.0, 1.0, 0.05], [0.0, 0.93, 1.0, 1.0], [0.0, 0.55, 0.22, 1.0], [0.85, 0.8, 1.0, 1.0]]
-#                                       # areas that change on their own (overlays, chat, weapon, stamina)
+#                                       # areas that change on their own (overlays, chat, panels, status bars)
 
 [keys]
 # Names: f1..f24, a..z, 0..9, numpad0..9, mouse3/mouse4/mouse5, space, tab, insert, home, ... or a code like "0x2D".

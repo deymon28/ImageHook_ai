@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from imagehook.capture import Recorder, RecordConfig
-from tests.conftest import scene
+from tests.conftest import scene, write_template
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="the recorder uses Win32 APIs")
 
@@ -25,7 +25,8 @@ def drifted(base: np.ndarray, k: int) -> np.ndarray:
 
 
 def test_burst_keeps_recent_waiting_frames(tmp_path, monkeypatch):
-    rec = Recorder(RecordConfig(out=tmp_path, any_window=True, beep=False, burst_back=10.0))
+    rec = Recorder(RecordConfig(out=tmp_path, any_window=True, beep=False, burst_back=10.0,
+                                template=write_template(tmp_path)))
     rec.start()
     base = scene(1, 360, 640)
     # one new view, then slowly drifting frames that the adaptive interval does not save yet
@@ -48,7 +49,7 @@ def test_burst_keeps_recent_waiting_frames(tmp_path, monkeypatch):
 
 
 def test_interface_frames_are_not_buffered_for_bursts(tmp_path, monkeypatch):
-    rec = Recorder(RecordConfig(out=tmp_path, any_window=True, beep=False))
+    rec = Recorder(RecordConfig(out=tmp_path, any_window=True, beep=False, template=write_template(tmp_path)))
     rec.start()
     cam = FakeCam([scene(2, 360, 640, icon=False)] * 2)
     clock = iter([0.0, 0.5])
@@ -59,7 +60,8 @@ def test_interface_frames_are_not_buffered_for_bursts(tmp_path, monkeypatch):
 
 
 def test_settings_block_and_status_line(tmp_path, monkeypatch):
-    rec = Recorder(RecordConfig(out=tmp_path, beep=False, game_processes=("Game.EXE",), config="imagehook.toml"))
+    rec = Recorder(RecordConfig(out=tmp_path, beep=False, game_processes=("Game.EXE",), config="imagehook.toml",
+                                template=write_template(tmp_path)))
     lines = rec.settings_lines(0, 2560, 1440, None)
     text = "\n".join(lines)
     assert lines[0].startswith("ImageHook ") and "imagehook.toml" in lines[0]
@@ -77,4 +79,17 @@ def test_settings_block_and_status_line(tmp_path, monkeypatch):
     monkeypatch.setattr(rec.fg, "name", lambda: "explorer.exe")
     rec.tick(cam)
     assert rec.session.skipped["not_game"] == 1
+    rec.close_session()
+
+
+def test_defaults_without_a_game_profile(tmp_path, monkeypatch):
+    # no template: the interface check is off; no game_processes: any foreground window counts
+    rec = Recorder(RecordConfig(out=tmp_path, beep=False))
+    text = "\n".join(rec.settings_lines(0, 1920, 1080, None))
+    assert "interface check off: no HUD template" in text and "any foreground window" in text
+    rec.start()
+    monkeypatch.setattr(rec.fg, "name", lambda: "anything.exe")
+    monkeypatch.setattr("imagehook.capture.time.monotonic", lambda: 0.0)
+    rec.tick(FakeCam([scene(3, 360, 640, icon=False)]))
+    assert rec.session.saved["first"] == 1 and not rec.session.skipped
     rec.close_session()

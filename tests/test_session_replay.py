@@ -10,11 +10,11 @@ import numpy as np
 import pytest
 
 from imagehook.detector import relevant_conf
-from imagehook.filters import CapturePolicy, PolicyConfig, load_template
+from imagehook.filters import CapturePolicy, PolicyConfig
 from imagehook.hotkeys import parse_key
 from imagehook.replay import iter_session, label_report, ordered_frames, replay
 from imagehook.session import Session, frame_stem, session_name
-from tests.conftest import scene
+from tests.conftest import make_template, scene
 
 # the labeling tool's export key: "<session>_<HHMMSS>_<mmm>"
 LABEL_KEY_RE = re.compile(r"(.+)_(\d{2})(\d{2})(\d{2})_(\d{3})$")
@@ -80,7 +80,7 @@ def test_replay_skips_interface_and_duplicates_and_reports_labels(tmp_path):
     status = {"120001_000": "neg", "120002_000": "neg", "120003_000": "skip", "120004_000": "pos",
               "120005_000": "pos", "120006_000": "pos"}
     s = make_session(tmp_path, seq, status)
-    policy = CapturePolicy(PolicyConfig(), load_template())
+    policy = CapturePolicy(PolicyConfig(), make_template())
     out = tmp_path / "thin" / s.name / "frames"
     res = replay(iter_session(s, None, 0.15, full=False), policy, write_dir=out)
     assert [r for _, _, r in res.decisions] == ["first", "duplicate", "ui", "change", "change", "duplicate"]
@@ -98,7 +98,7 @@ def test_replay_emulates_detector_from_prelabel_output(tmp_path):
     s = make_session(tmp_path, [("120001_000", base), ("120002_000", drift)])
     (s / "labels_auto").mkdir()
     (s / "labels_auto" / "120002_000.txt").write_text("0 0.5 0.5 0.01 0.03 0.800\n", encoding="utf-8")
-    policy = CapturePolicy(PolicyConfig(), load_template())
+    policy = CapturePolicy(PolicyConfig(), make_template())
     res = replay(iter_session(s, s / "labels_auto", 0.15, full=False), policy)
     assert [r for _, _, r in res.decisions] == ["first", "detection"]
 

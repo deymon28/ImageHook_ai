@@ -17,16 +17,16 @@ from .filters import ICON_ZONE, Box
 @dataclass
 class DetectorConfig:
     weights: Path
-    imgsz: int = 0  # 0 = native: the frame's long side (2560 for 1440p), like screendet
+    imgsz: int = 0  # 0 = native: the frame's long side (2560 for 1440p)
     conf: float = 0.1  # proposals below this are not even reported; the policy threshold is PolicyConfig.det_conf
     max_height: float = 0.15  # ignore boxes taller than this share of the frame: close people matter little
     max_vram_gb: float = 1.0  # PyTorch allocator cap (the CUDA context comes on top)
-    icon_zone: Box = ICON_ZONE  # detections on the HUD body icon are ignored
+    icon_zone: Box = ICON_ZONE  # detections on the HUD icon are ignored
 
 
 def relevant_conf(boxes_xywhn: list[tuple[float, float, float, float]], confs: list[float], max_height: float,
                   icon_zone: Box = ICON_ZONE) -> float:
-    """Max confidence over boxes that are not the HUD body icon and not taller than max_height (0 if none)."""
+    """Max confidence over boxes that are not on the HUD icon and not taller than max_height (0 if none)."""
     x1, y1, x2, y2 = icon_zone
     best = 0.0
     for (cx, cy, _bw, bh), c in zip(boxes_xywhn, confs):
